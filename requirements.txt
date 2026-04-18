@@ -2,3 +2,6 @@ streamlit
 fitparse
 pandas
 plotly
+folium
+streamlit-folium
+numpy
