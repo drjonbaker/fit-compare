@@ -1,0 +1,4 @@
+streamlit
+fitparse
+pandas
+plotly
