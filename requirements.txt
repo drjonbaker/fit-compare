@@ -5,3 +5,5 @@ plotly
 folium
 streamlit-folium
 numpy
+kaleido
+reportlab
