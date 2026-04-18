@@ -14,14 +14,17 @@ Run with:
 from __future__ import annotations
 
 import io
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
+import folium
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 from fitparse import FitFile
 from plotly.subplots import make_subplots
+from streamlit_folium import st_folium
 
 # ---------------------------------------------------------------------------
 # Page config & styling
@@ -63,6 +66,18 @@ CHANNELS = [
     {"key": "altitude",  "label": "Elevation",  "unit": "m",    "y_zero": False},
 ]
 
+# Standard durations for the mean max power curve (in seconds).
+# Log-spaced from 1s to 1h — matches the convention used by TrainingPeaks,
+# Golden Cheetah, etc.
+MMP_DURATIONS = [
+    1, 2, 3, 5, 7, 10, 15, 20, 30, 45,
+    60, 90, 120, 180, 240, 300, 420, 600,
+    900, 1200, 1800, 2400, 3000, 3600,
+]
+
+# Semicircles → degrees conversion for GPS coordinates in FIT files
+SEMICIRCLE_TO_DEG = 180.0 / (2 ** 31)
+
 
 # ---------------------------------------------------------------------------
 # Parsing
@@ -74,55 +89,95 @@ class Ride:
     color: str
     df: pd.DataFrame
     stats: dict[str, Any]
+    sensors: list[dict[str, Any]] = field(default_factory=list)
 
 
 @st.cache_data(show_spinner=False)
-def parse_fit(file_bytes: bytes, filename: str) -> pd.DataFrame:
-    """Parse a .fit file's record messages into a tidy DataFrame.
+def parse_fit(file_bytes: bytes, filename: str) -> tuple[pd.DataFrame, list[dict]]:
+    """Parse a .fit file's record and device_info messages.
 
-    Cached on the raw bytes so re-runs (changing smoothing, toggling zeros)
-    don't re-parse.
+    Returns (records_df, sensors_list). Cached on the raw bytes so re-runs
+    (changing smoothing, toggling zeros) don't re-parse.
     """
     fit = FitFile(io.BytesIO(file_bytes))
     fit.parse()
 
+    # --- Records ---------------------------------------------------------
     rows = []
     for record in fit.get_messages("record"):
         row: dict[str, Any] = {}
-        for field in record:
-            # fitparse returns speed in m/s by default; convert to km/h
-            if field.name == "speed" and field.value is not None:
-                row["speed"] = field.value * 3.6
-            # Prefer enhanced_altitude when present (more precise)
-            elif field.name == "enhanced_altitude" and field.value is not None:
-                row["altitude"] = field.value
-            elif field.name == "altitude" and "altitude" not in row:
-                row["altitude"] = field.value
-            elif field.name == "enhanced_speed" and field.value is not None:
-                row["speed"] = field.value * 3.6
+        for fld in record:
+            name, val = fld.name, fld.value
+
+            # fitparse returns speed in m/s by default — convert to km/h.
+            # Prefer enhanced_* fields when present (higher precision).
+            if name == "speed" and val is not None:
+                row["speed"] = val * 3.6
+            elif name == "enhanced_speed" and val is not None:
+                row["speed"] = val * 3.6
+            elif name == "enhanced_altitude" and val is not None:
+                row["altitude"] = val
+            elif name == "altitude" and "altitude" not in row:
+                row["altitude"] = val
+            # GPS coords arrive as semicircles — convert to degrees
+            elif name == "position_lat" and val is not None:
+                row["lat"] = val * SEMICIRCLE_TO_DEG
+            elif name == "position_long" and val is not None:
+                row["lon"] = val * SEMICIRCLE_TO_DEG
             else:
-                row[field.name] = field.value
+                row[name] = val
         if row:
             rows.append(row)
 
-    if not rows:
-        return pd.DataFrame()
+    df = pd.DataFrame(rows) if rows else pd.DataFrame()
 
-    df = pd.DataFrame(rows)
+    if not df.empty:
+        # Elapsed seconds from first record — our overlay axis
+        if "timestamp" in df.columns:
+            df["timestamp"] = pd.to_datetime(df["timestamp"])
+            df["elapsed_s"] = (df["timestamp"] - df["timestamp"].iloc[0]).dt.total_seconds()
+        else:
+            df["elapsed_s"] = range(len(df))
 
-    # Elapsed seconds from first record — this is the axis we overlay on
-    if "timestamp" in df.columns:
-        df["timestamp"] = pd.to_datetime(df["timestamp"])
-        df["elapsed_s"] = (df["timestamp"] - df["timestamp"].iloc[0]).dt.total_seconds()
-    else:
-        df["elapsed_s"] = range(len(df))
+        # Derive left/right power from left_right_balance + total power.
+        # left_right_balance in FIT files is percent right (0-100). Some meters
+        # set a high bit to indicate which side the percentage refers to; we
+        # strip it by masking to the low 7 bits.
+        if "left_right_balance" in df.columns and "power" in df.columns:
+            lrb = pd.to_numeric(df["left_right_balance"], errors="coerce")
+            # Mask to 7 bits if values look like they have the right-flag bit set
+            lrb = lrb.where(lrb <= 100, lrb.astype("Int64") & 0x7F)
+            pct_right = lrb / 100.0
+            pwr = pd.to_numeric(df["power"], errors="coerce")
+            df["right_power"] = (pwr * pct_right).round()
+            df["left_power"] = (pwr * (1 - pct_right)).round()
 
-    # Ensure every channel column exists so downstream code can stop worrying
-    for ch in CHANNELS:
-        if ch["key"] not in df.columns:
-            df[ch["key"]] = None
+        # Ensure every channel column exists so downstream code can stop worrying
+        for ch in CHANNELS:
+            if ch["key"] not in df.columns:
+                df[ch["key"]] = None
 
-    return df
+    # --- Device info (sensors) ------------------------------------------
+    sensors = []
+    seen = set()
+    for dev in fit.get_messages("device_info"):
+        info: dict[str, Any] = {}
+        for fld in dev:
+            info[fld.name] = fld.value
+        # De-dupe by (manufacturer, product, serial_number) — devices announce
+        # themselves multiple times over a ride.
+        key = (
+            str(info.get("manufacturer", "")),
+            str(info.get("product", "")),
+            str(info.get("serial_number", "")),
+            str(info.get("device_type", "")),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        sensors.append(info)
+
+    return df, sensors
 
 
 def compute_stats(df: pd.DataFrame) -> dict[str, Any]:
@@ -170,7 +225,27 @@ def compute_stats(df: pd.DataFrame) -> dict[str, Any]:
         "avg_speed": safe_mean(df.get("speed"), exclude_zero=True),
         "distance_km": distance_km,
         "ascent": ascent,
+        "avg_left_power": safe_mean(df.get("left_power"), exclude_zero=True),
+        "avg_right_power": safe_mean(df.get("right_power"), exclude_zero=True),
     }
+
+
+def mean_max_power(power_series: pd.Series, durations: list[int]) -> dict[int, float]:
+    """Compute mean max power for each duration (seconds).
+
+    For each duration d, finds the highest d-second rolling average in the ride.
+    This is the standard "power curve" used by TrainingPeaks, Golden Cheetah, etc.
+    """
+    power = pd.to_numeric(power_series, errors="coerce").fillna(0)
+    total_len = len(power)
+    results = {}
+    for d in durations:
+        if d > total_len:
+            break
+        rolling = power.rolling(window=d, min_periods=d).mean()
+        if rolling.notna().any():
+            results[d] = float(rolling.max())
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -184,6 +259,19 @@ def fmt_duration(seconds: float | None) -> str:
     m = int((seconds % 3600) // 60)
     s = int(seconds % 60)
     return f"{h}h {m:02d}m" if h else f"{m}m {s:02d}s"
+
+
+def fmt_mmp_label(seconds: int) -> str:
+    """Format a duration for MMP axis labels: 1s, 15s, 1m, 5m, 20m, 1h."""
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        m = seconds // 60
+        s = seconds % 60
+        return f"{m}m" if s == 0 else f"{m}m{s}s"
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    return f"{h}h" if m == 0 else f"{h}h{m}m"
 
 
 def fmt(value: float | None, unit: str = "", dp: int = 0) -> str:
@@ -245,7 +333,7 @@ rides: list[Ride] = []
 with st.spinner(f"Parsing {len(uploaded)} files…"):
     for i, uf in enumerate(uploaded):
         try:
-            df = parse_fit(uf.getvalue(), uf.name)
+            df, sensors = parse_fit(uf.getvalue(), uf.name)
             if df.empty:
                 st.warning(f"`{uf.name}` contains no record messages — skipping.")
                 continue
@@ -255,6 +343,7 @@ with st.spinner(f"Parsing {len(uploaded)} files…"):
                 color=COLORS[i % len(COLORS)],
                 df=df,
                 stats=stats,
+                sensors=sensors,
             ))
         except Exception as e:
             st.error(f"Couldn't parse `{uf.name}`: {e}")
@@ -423,7 +512,184 @@ fig.update_layout(
 st.plotly_chart(fig, use_container_width=True)
 
 # ---------------------------------------------------------------------------
-# Scatter — power vs power (only meaningful with exactly two rides)
+# Mean Max Power curve
+# ---------------------------------------------------------------------------
+
+has_power = any(
+    pd.to_numeric(r.df.get("power"), errors="coerce").dropna().shape[0] > 0
+    for r in rides
+)
+
+if has_power:
+    st.subheader("Mean Max Power")
+    st.caption(
+        "Best rolling-average power for each duration. A systematic gap at short durations "
+        "but not long ones (or vice versa) usually points to different smoothing algorithms "
+        "between the two meters."
+    )
+
+    mmp_fig = go.Figure()
+    mmp_data = {}  # for showing the delta below
+    for r in rides:
+        mmp = mean_max_power(r.df["power"], MMP_DURATIONS)
+        mmp_data[r.name] = mmp
+        if not mmp:
+            continue
+        xs = list(mmp.keys())
+        ys = list(mmp.values())
+        mmp_fig.add_trace(go.Scatter(
+            x=xs,
+            y=ys,
+            mode="lines+markers",
+            name=r.name,
+            line=dict(color=r.color, width=2),
+            marker=dict(size=5),
+            hovertemplate=(
+                f"<b>{r.name}</b><br>"
+                "duration=%{customdata}<br>"
+                "power=%{y:.0f} W<extra></extra>"
+            ),
+            customdata=[fmt_mmp_label(x) for x in xs],
+        ))
+
+    # Tick marks at the canonical durations
+    tick_durations = [1, 5, 15, 60, 300, 1200, 3600]
+    mmp_fig.update_layout(
+        height=420,
+        xaxis=dict(
+            type="log",
+            title="Duration",
+            tickvals=tick_durations,
+            ticktext=[fmt_mmp_label(d) for d in tick_durations],
+            gridcolor="#eef0f4",
+        ),
+        yaxis=dict(title="Power (W)", gridcolor="#eef0f4", rangemode="tozero"),
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        margin=dict(l=60, r=20, t=40, b=40),
+        font=dict(family="system-ui, -apple-system, sans-serif", size=12),
+    )
+    st.plotly_chart(mmp_fig, use_container_width=True)
+
+    # If exactly two files, show the delta at a few canonical durations
+    if len(rides) == 2 and mmp_data[rides[0].name] and mmp_data[rides[1].name]:
+        a_mmp = mmp_data[rides[0].name]
+        b_mmp = mmp_data[rides[1].name]
+        st.markdown("**MMP Δ at key durations**")
+        highlight_durations = [5, 60, 300, 1200]  # 5s, 1m, 5m, 20m
+        cols = st.columns(len(highlight_durations))
+        for col, d in zip(cols, highlight_durations):
+            if d in a_mmp and d in b_mmp:
+                av, bv = a_mmp[d], b_mmp[d]
+                delta = bv - av
+                pct = (delta / av * 100) if av else 0
+                col.metric(
+                    fmt_mmp_label(d),
+                    f"{bv:.0f} W",
+                    delta=f"{delta:+.0f} W ({pct:+.1f}%)",
+                )
+            else:
+                col.metric(fmt_mmp_label(d), "—")
+
+# ---------------------------------------------------------------------------
+# Left/Right power balance
+# ---------------------------------------------------------------------------
+
+has_lr = any(
+    "left_power" in r.df.columns
+    and pd.to_numeric(r.df["left_power"], errors="coerce").dropna().shape[0] > 0
+    for r in rides
+)
+
+if has_lr:
+    st.subheader("Left / Right Power")
+    st.caption(
+        "Dual-sided power meter data. Gaps here usually mean one of the files doesn't "
+        "have dual-sided data (single-sided meters report 50/50 by convention)."
+    )
+
+    # One plot per ride so the left/right traces don't all collide
+    lr_rides = [r for r in rides if
+                "left_power" in r.df.columns
+                and pd.to_numeric(r.df["left_power"], errors="coerce").dropna().shape[0] > 0]
+
+    lr_fig = make_subplots(
+        rows=len(lr_rides),
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.06,
+        subplot_titles=[r.name for r in lr_rides],
+    )
+
+    for row_idx, r in enumerate(lr_rides, start=1):
+        for side_key, side_label, dash in [("left_power", "Left", "solid"),
+                                           ("right_power", "Right", "dash")]:
+            y = prepare_series(r.df, side_key, smoothing, show_zeros=False)
+            lr_fig.add_trace(
+                go.Scatter(
+                    x=r.df["elapsed_s"],
+                    y=y,
+                    mode="lines",
+                    name=f"{r.name} — {side_label}",
+                    line=dict(color=r.color, width=1.2, dash=dash),
+                    showlegend=True,
+                    legendgroup=f"{r.name}-{side_label}",
+                    hovertemplate=(
+                        f"<b>{r.name} {side_label}</b><br>"
+                        "t=%{x:.0f}s<br>"
+                        "%{y:.0f} W<extra></extra>"
+                    ),
+                ),
+                row=row_idx, col=1,
+            )
+        lr_fig.update_yaxes(
+            title_text="W", row=row_idx, col=1,
+            gridcolor="#eef0f4", rangemode="tozero",
+        )
+
+    lr_fig.update_xaxes(
+        title_text="Elapsed time",
+        row=len(lr_rides), col=1,
+        tickvals=tick_vals, ticktext=tick_text,
+        gridcolor="#eef0f4",
+    )
+    for i in range(1, len(lr_rides)):
+        lr_fig.update_xaxes(tickvals=tick_vals, ticktext=tick_text, row=i, col=1,
+                            gridcolor="#eef0f4")
+
+    lr_fig.update_layout(
+        height=220 * len(lr_rides) + 60,
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        margin=dict(l=60, r=20, t=60, b=40),
+        font=dict(family="system-ui, -apple-system, sans-serif", size=12),
+    )
+    st.plotly_chart(lr_fig, use_container_width=True)
+
+    # Balance summary per ride
+    cols = st.columns(len(lr_rides))
+    for col, r in zip(cols, lr_rides):
+        left = r.stats.get("avg_left_power")
+        right = r.stats.get("avg_right_power")
+        if left is None or right is None or (left + right) == 0:
+            col.metric(r.name.replace(".fit", ""), "—")
+            continue
+        total = left + right
+        left_pct = left / total * 100
+        right_pct = right / total * 100
+        col.metric(
+            r.name.replace(".fit", ""),
+            f"{left_pct:.0f}% / {right_pct:.0f}%",
+            delta=f"L {left:.0f}W · R {right:.0f}W",
+            delta_color="off",
+        )
+
+# ---------------------------------------------------------------------------
+# Power vs Power scatter (only meaningful with exactly two rides)
 # ---------------------------------------------------------------------------
 
 if len(rides) == 2:
@@ -431,8 +697,7 @@ if len(rides) == 2:
     a_pwr = pd.to_numeric(a.df["power"], errors="coerce")
     b_pwr = pd.to_numeric(b.df["power"], errors="coerce")
 
-    # Align by elapsed second — merge_asof handles the case where the two
-    # devices have slightly different record timings
+    # Align by elapsed second — merge_asof handles slightly different record timings
     a_aligned = pd.DataFrame({"t": a.df["elapsed_s"], "a": a_pwr}).dropna()
     b_aligned = pd.DataFrame({"t": b.df["elapsed_s"], "b": b_pwr}).dropna()
 
@@ -509,3 +774,96 @@ if len(rides) == 2:
                 margin=dict(l=60, r=20, t=40, b=40),
             )
             st.plotly_chart(scatter_fig, use_container_width=True)
+
+# ---------------------------------------------------------------------------
+# GPS map
+# ---------------------------------------------------------------------------
+
+has_gps = any(
+    "lat" in r.df.columns
+    and pd.to_numeric(r.df["lat"], errors="coerce").dropna().shape[0] > 0
+    for r in rides
+)
+
+if has_gps:
+    st.subheader("GPS")
+    st.caption("Overlay of each ride's track. Useful for checking both files are the same ride.")
+
+    # Collect valid GPS points for each ride
+    tracks = []
+    all_points = []
+    for r in rides:
+        if "lat" not in r.df.columns:
+            continue
+        gps = r.df[["lat", "lon"]].dropna()
+        gps = gps[(gps["lat"].between(-90, 90)) & (gps["lon"].between(-180, 180))]
+        if len(gps) < 2:
+            continue
+        points = list(zip(gps["lat"].tolist(), gps["lon"].tolist()))
+        tracks.append((r, points))
+        all_points.extend(points)
+
+    if all_points:
+        # Center the map on the mean of all points
+        avg_lat = np.mean([p[0] for p in all_points])
+        avg_lon = np.mean([p[1] for p in all_points])
+        m = folium.Map(
+            location=[avg_lat, avg_lon],
+            zoom_start=13,
+            tiles="OpenStreetMap",
+        )
+        # Fit bounds to all tracks
+        lats = [p[0] for p in all_points]
+        lons = [p[1] for p in all_points]
+        m.fit_bounds([[min(lats), min(lons)], [max(lats), max(lons)]])
+
+        for r, points in tracks:
+            folium.PolyLine(
+                points,
+                color=r.color,
+                weight=3,
+                opacity=0.85,
+                tooltip=r.name,
+            ).add_to(m)
+            # Start marker
+            folium.CircleMarker(
+                points[0], radius=6, color=r.color,
+                fill=True, fill_color=r.color, fill_opacity=1,
+                tooltip=f"{r.name} · start",
+            ).add_to(m)
+
+        st_folium(m, width=None, height=450, returned_objects=[])
+
+# ---------------------------------------------------------------------------
+# Sensors table
+# ---------------------------------------------------------------------------
+
+has_sensors = any(r.sensors for r in rides)
+
+if has_sensors:
+    st.subheader("Sensors")
+    st.caption("Devices that contributed data to each file (power meters, heart-rate straps, head units).")
+
+    sensor_rows = []
+    for r in rides:
+        for dev in r.sensors:
+            manufacturer = dev.get("manufacturer")
+            device_type = dev.get("device_type")
+            product = dev.get("product") or dev.get("product_name")
+            # Skip entries with no useful identifying info
+            if not any([manufacturer, product, device_type]):
+                continue
+            sensor_rows.append({
+                "File": r.name,
+                "Device Type": str(device_type) if device_type else "—",
+                "Manufacturer": str(manufacturer) if manufacturer else "—",
+                "Product": str(product) if product else "—",
+                "Serial": str(dev.get("serial_number", "—")),
+                "SW Version": str(dev.get("software_version", "—")),
+            })
+
+    if sensor_rows:
+        sensors_df = pd.DataFrame(sensor_rows)
+        st.dataframe(sensors_df, hide_index=True, use_container_width=True)
+    else:
+        st.caption("No named devices found in either file.")
