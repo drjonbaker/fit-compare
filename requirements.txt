@@ -5,5 +5,5 @@ plotly
 folium
 streamlit-folium
 numpy
-kaleido
+kaleido==0.2.1
 reportlab
