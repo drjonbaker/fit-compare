@@ -98,6 +98,10 @@ COGGAN_ZONES = [
 
 SEMICIRCLE_TO_DEG = 180.0 / (2 ** 31)
 
+# Cap on uploaded files — 10 is the rough maximum team size in a WorldTour
+# team, which is a natural ceiling for "how many riders would you compare?"
+MAX_FILES = 10
+
 
 # ---------------------------------------------------------------------------
 # Parsing
@@ -111,6 +115,8 @@ class Ride:
     stats: dict[str, Any]
     sensors: list[dict[str, Any]] = field(default_factory=list)
     sample_rate_hz: float = 1.0  # records per second — usually 1, sometimes 0.25/0.5
+    ftp: float = 250.0     # per-rider FTP in watts, set in sidebar
+    weight: float = 75.0   # per-rider weight in kg, set in sidebar
 
 
 @st.cache_data(show_spinner=False)
@@ -375,6 +381,28 @@ def style_chart(fig: go.Figure) -> go.Figure:
 
 
 # ---------------------------------------------------------------------------
+# Power-unit helpers (W vs W/kg)
+# ---------------------------------------------------------------------------
+
+def to_display_power(value, weight_kg: float, use_wkg: bool):
+    """Convert a power scalar or pandas Series to the currently selected unit."""
+    if value is None:
+        return None
+    if use_wkg and weight_kg and weight_kg > 0:
+        return value / weight_kg
+    return value
+
+
+def power_unit_label(use_wkg: bool) -> str:
+    return "W/kg" if use_wkg else "W"
+
+
+def power_dp(use_wkg: bool) -> int:
+    """How many decimal places to show for power in the current unit."""
+    return 2 if use_wkg else 0
+
+
+# ---------------------------------------------------------------------------
 # UI — header & inputs
 # ---------------------------------------------------------------------------
 
@@ -389,8 +417,22 @@ uploaded = st.file_uploader(
     "Drop .fit files here",
     type=["fit"],
     accept_multiple_files=True,
-    help="Upload 2 or more .fit files. They'll be aligned by elapsed time from the first record.",
+    help=f"Upload 2-{MAX_FILES} .fit files. They'll be aligned by elapsed time from the first record.",
 )
+
+# Enforce the cap before going further so the sidebar doesn't try to render
+# inputs for 20 files.
+if uploaded and len(uploaded) > MAX_FILES:
+    st.error(
+        f"Too many files ({len(uploaded)}). This tool accepts up to {MAX_FILES} at once — "
+        f"please drop a few. Only the first {MAX_FILES} will be used."
+    )
+    uploaded = uploaded[:MAX_FILES]
+
+# --- Sidebar ----------------------------------------------------------------
+# Per-rider FTP and weight inputs are rendered after file upload. We use
+# session_state keyed on filename so a user's values persist across reruns
+# (e.g. when they tweak the smoothing slider).
 
 with st.sidebar:
     st.header("Options")
@@ -404,13 +446,49 @@ with st.sidebar:
         value=True,
         help="When off, zero power/cadence points are hidden (useful to mask coasting dropouts).",
     )
-    st.markdown("---")
-    st.subheader("Power zones")
-    ftp = st.number_input(
-        "FTP (W)",
-        min_value=50, max_value=600, value=250, step=5,
-        help="Used for Coggan zone boundaries (Z1 to Z7).",
+    power_unit = st.radio(
+        "Power units",
+        options=["Watts", "W/kg"],
+        horizontal=True,
+        help="W/kg divides by each rider's weight (set per file below). Useful when comparing riders of different sizes.",
     )
+    use_wkg = (power_unit == "W/kg")
+
+    # Per-file rider inputs — only appear once files have been uploaded
+    rider_inputs: dict[str, dict[str, float]] = {}
+    if uploaded:
+        st.markdown("---")
+        st.subheader("Riders")
+        st.caption("FTP and weight per file. Used for zones and W/kg calculations.")
+        for uf in uploaded:
+            # Use a shortened label to save sidebar real estate
+            short = uf.name if len(uf.name) <= 24 else uf.name[:21] + "…"
+            st.markdown(f"**{short}**")
+
+            ftp_key = f"ftp__{uf.name}"
+            wt_key = f"weight__{uf.name}"
+            if ftp_key not in st.session_state:
+                st.session_state[ftp_key] = 250
+            if wt_key not in st.session_state:
+                st.session_state[wt_key] = 75.0
+
+            col1, col2 = st.columns(2)
+            with col1:
+                ftp_val = st.number_input(
+                    "FTP (W)",
+                    min_value=50, max_value=600, step=5,
+                    key=ftp_key,
+                    label_visibility="visible",
+                )
+            with col2:
+                wt_val = st.number_input(
+                    "Weight (kg)",
+                    min_value=30.0, max_value=150.0, step=0.5,
+                    key=wt_key,
+                    label_visibility="visible",
+                )
+            rider_inputs[uf.name] = {"ftp": float(ftp_val), "weight": float(wt_val)}
+
     st.markdown("---")
     st.caption(
         "Built for comparing indoor trainers against outdoor power meters, "
@@ -418,7 +496,7 @@ with st.sidebar:
     )
 
 if not uploaded:
-    st.info("Upload at least two .fit files to begin.")
+    st.info(f"Upload 2-{MAX_FILES} .fit files to begin.")
     st.stop()
 
 if len(uploaded) < 2:
@@ -438,6 +516,7 @@ with st.spinner(f"Parsing {len(uploaded)} files…"):
                 st.warning(f"`{uf.name}` contains no record messages — skipping.")
                 continue
             stats = compute_stats(df, sample_rate)
+            inputs = rider_inputs.get(uf.name, {"ftp": 250.0, "weight": 75.0})
             rides.append(Ride(
                 name=uf.name,
                 color=COLORS[i % len(COLORS)],
@@ -445,6 +524,8 @@ with st.spinner(f"Parsing {len(uploaded)} files…"):
                 stats=stats,
                 sensors=sensors,
                 sample_rate_hz=sample_rate,
+                ftp=inputs["ftp"],
+                weight=inputs["weight"],
             ))
         except Exception as e:
             st.error(f"Couldn't parse `{uf.name}`: {e}")
@@ -468,15 +549,19 @@ if unusual_rates:
 
 st.subheader("Summary")
 
+pu = power_unit_label(use_wkg)
+pd_ = power_dp(use_wkg)
+
 stats_rows = []
 for r in rides:
     s = r.stats
     stats_rows.append({
         "File": r.name,
+        "Rider (FTP / kg)": f"{r.ftp:.0f}W / {r.weight:.1f}kg",
         "Duration": fmt_duration(s.get("duration_s")),
-        "Avg Power": fmt(s.get("avg_power"), "W", 0),
-        "NP": fmt(s.get("np"), "W", 0),
-        "Max Power": fmt(s.get("max_power"), "W", 0),
+        f"Avg Power ({pu})": fmt(to_display_power(s.get("avg_power"), r.weight, use_wkg), pu, pd_),
+        f"NP ({pu})": fmt(to_display_power(s.get("np"), r.weight, use_wkg), pu, pd_),
+        f"Max Power ({pu})": fmt(to_display_power(s.get("max_power"), r.weight, use_wkg), pu, pd_),
         "Work": fmt(s.get("total_kj"), "kJ", 0),
         "Avg HR": fmt(s.get("avg_hr"), "bpm", 0),
         "Avg Cadence": fmt(s.get("avg_cadence"), "rpm", 0),
@@ -494,25 +579,33 @@ if len(rides) == 2:
     st.markdown(f"**Δ — `{b.name}` vs `{a.name}`**")
 
     cols = st.columns(6)
+    # Note: for W/kg deltas, each rider converts with its own weight. The
+    # percentage is then computed in the chosen unit (identical either way
+    # when both riders have weight set, which makes the ratio a pure scalar).
     metrics = [
-        ("Avg Power", "avg_power", "W", 0),
-        ("NP", "np", "W", 0),
-        ("Max Power", "max_power", "W", 0),
-        ("Work", "total_kj", "kJ", 0),
-        ("Avg HR", "avg_hr", "bpm", 0),
-        ("Avg Cadence", "avg_cadence", "rpm", 0),
+        ("Avg Power", "avg_power", pu, pd_, True),
+        ("NP", "np", pu, pd_, True),
+        ("Max Power", "max_power", pu, pd_, True),
+        ("Work", "total_kj", "kJ", 0, False),
+        ("Avg HR", "avg_hr", "bpm", 0, False),
+        ("Avg Cadence", "avg_cadence", "rpm", 0, False),
     ]
-    for col, (label, key, unit, dp) in zip(cols, metrics):
+    for col, (label, key, unit, dp, is_power) in zip(cols, metrics):
         av = a.stats.get(key)
         bv = b.stats.get(key)
         if av is None or bv is None:
             col.metric(label, "—")
             continue
-        delta = bv - av
-        pct = (delta / av * 100) if av else 0
+        if is_power:
+            av_disp = to_display_power(av, a.weight, use_wkg)
+            bv_disp = to_display_power(bv, b.weight, use_wkg)
+        else:
+            av_disp, bv_disp = av, bv
+        delta = bv_disp - av_disp
+        pct = (delta / av_disp * 100) if av_disp else 0
         col.metric(
             label,
-            f"{bv:,.{dp}f} {unit}",
+            f"{bv_disp:,.{dp}f} {unit}",
             delta=f"{delta:+.{dp}f} {unit} ({pct:+.1f}%)",
             delta_color="normal",
         )
@@ -570,12 +663,20 @@ fig = make_subplots(
     cols=1,
     shared_xaxes=True,
     vertical_spacing=0.035,
-    subplot_titles=[f"{ch['label']} ({ch['unit']})" for ch in active_channels],
+    subplot_titles=[
+        f"{ch['label']} ({pu if ch['key'] == 'power' else ch['unit']})"
+        for ch in active_channels
+    ],
 )
 
 for row_idx, ch in enumerate(active_channels, start=1):
+    is_power = (ch["key"] == "power")
+    display_unit = pu if is_power else ch["unit"]
     for r in rides:
         y = prepare_series(r.df, ch["key"], smoothing, show_zeros, r.sample_rate_hz)
+        # Convert power to W/kg per rider if the toggle is on
+        if is_power:
+            y = to_display_power(y, r.weight, use_wkg)
         fig.add_trace(
             go.Scatter(
                 x=r.df["elapsed_s"],
@@ -588,13 +689,13 @@ for row_idx, ch in enumerate(active_channels, start=1):
                 hovertemplate=(
                     f"<b>{r.name}</b><br>"
                     "t=%{x:.0f}s<br>"
-                    f"{ch['label']}=%{{y:.1f}} {ch['unit']}<extra></extra>"
+                    f"{ch['label']}=%{{y:.2f}} {display_unit}<extra></extra>"
                 ),
             ),
             row=row_idx, col=1,
         )
     fig.update_yaxes(
-        title_text=ch["unit"], row=row_idx, col=1,
+        title_text=display_unit, row=row_idx, col=1,
         gridcolor="#eef0f4",
         rangemode="tozero" if ch["y_zero"] else "normal",
     )
@@ -685,10 +786,10 @@ if has_power:
         if not mmp:
             continue
         xs = list(mmp.keys())
-        ys = list(mmp.values())
+        ys_display = [to_display_power(v, r.weight, use_wkg) for v in mmp.values()]
         mmp_fig.add_trace(go.Scatter(
             x=xs,
-            y=ys,
+            y=ys_display,
             mode="lines+markers",
             name=r.name,
             line=dict(color=r.color, width=2),
@@ -696,7 +797,7 @@ if has_power:
             hovertemplate=(
                 f"<b>{r.name}</b><br>"
                 "duration=%{customdata}<br>"
-                "power=%{y:.0f} W<extra></extra>"
+                f"power=%{{y:.{pd_}f}} {pu}<extra></extra>"
             ),
             customdata=[fmt_mmp_label(x) for x in xs],
         ))
@@ -711,7 +812,7 @@ if has_power:
             ticktext=[fmt_mmp_label(d) for d in tick_durations],
             gridcolor="#eef0f4",
         ),
-        yaxis=dict(title="Power (W)", gridcolor="#eef0f4", rangemode="tozero"),
+        yaxis=dict(title=f"Power ({pu})", gridcolor="#eef0f4", rangemode="tozero"),
         hovermode="x unified",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
         margin=dict(l=60, r=20, t=40, b=40),
@@ -721,18 +822,19 @@ if has_power:
     if len(rides) == 2 and mmp_data[rides[0].name] and mmp_data[rides[1].name]:
         a_mmp = mmp_data[rides[0].name]
         b_mmp = mmp_data[rides[1].name]
-        st.markdown("**MMP Δ at key durations**")
+        st.markdown(f"**MMP Δ at key durations ({pu})**")
         highlight_durations = [5, 60, 300, 1200]
         cols = st.columns(len(highlight_durations))
         for col, d in zip(cols, highlight_durations):
             if d in a_mmp and d in b_mmp:
-                av, bv = a_mmp[d], b_mmp[d]
+                av = to_display_power(a_mmp[d], rides[0].weight, use_wkg)
+                bv = to_display_power(b_mmp[d], rides[1].weight, use_wkg)
                 delta = bv - av
                 pct = (delta / av * 100) if av else 0
                 col.metric(
                     fmt_mmp_label(d),
-                    f"{bv:.0f} W",
-                    delta=f"{delta:+.0f} W ({pct:+.1f}%)",
+                    f"{bv:.{pd_}f} {pu}",
+                    delta=f"{delta:+.{pd_}f} {pu} ({pct:+.1f}%)",
                 )
             else:
                 col.metric(fmt_mmp_label(d), "—")
@@ -744,14 +846,20 @@ if has_power:
 if has_power:
     st.subheader("Time in Zones")
     st.caption(
-        f"Coggan power zones based on FTP = {ftp} W (change in sidebar). Shown as stacked "
-        "bars per ride — any shift in the distribution shows up even when averages agree."
+        "Coggan power zones based on each rider's FTP (set in sidebar). Zones are "
+        "normalised to each rider's threshold — so Z3 ('Tempo') means the same "
+        "relative intensity for each ride regardless of absolute wattage."
     )
 
     zone_fig = go.Figure()
     zone_results = {}
+    # Label each row with FTP so a user can see at a glance what each rider's
+    # zones are pegged to.
+    ride_labels = [f"{r.name} · FTP {r.ftp:.0f}W" for r in rides]
+    label_by_name = {r.name: ride_labels[i] for i, r in enumerate(rides)}
+
     for r in rides:
-        zones = time_in_zones(r.df["power"], ftp, r.sample_rate_hz)
+        zones = time_in_zones(r.df["power"], r.ftp, r.sample_rate_hz)
         zone_results[r.name] = zones
 
     # Stacked horizontal bars, one per ride. Each zone is a separate trace so
@@ -763,7 +871,7 @@ if has_power:
             seconds = zones[zone_idx][1]
             pct = zones[zone_idx][2]
             xs.append(pct)
-            ys.append(r.name)
+            ys.append(label_by_name[r.name])
             texts.append(f"{pct:.0f}%" if pct >= 3 else "")
             hovers.append(
                 f"<b>{r.name}</b><br>"
@@ -789,7 +897,7 @@ if has_power:
         yaxis=dict(autorange="reversed"),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0,
                     font=dict(size=11)),
-        margin=dict(l=120, r=20, t=60, b=40),
+        margin=dict(l=180, r=20, t=60, b=40),
     )
     st.plotly_chart(style_chart(zone_fig), use_container_width=True)
 
@@ -828,6 +936,7 @@ if has_lr:
             ("right_power", "Right", LR_COLORS["right"]),
         ]:
             y = prepare_series(r.df, side_key, smoothing, False, r.sample_rate_hz)
+            y = to_display_power(y, r.weight, use_wkg)
             lr_fig.add_trace(
                 go.Scatter(
                     x=r.df["elapsed_s"],
@@ -841,13 +950,13 @@ if has_lr:
                     hovertemplate=(
                         f"<b>{r.name} {side_label}</b><br>"
                         "t=%{x:.0f}s<br>"
-                        "%{y:.0f} W<extra></extra>"
+                        f"%{{y:.{pd_}f}} {pu}<extra></extra>"
                     ),
                 ),
                 row=row_idx, col=1,
             )
         lr_fig.update_yaxes(
-            title_text="W", row=row_idx, col=1,
+            title_text=pu, row=row_idx, col=1,
             gridcolor="#eef0f4", rangemode="tozero",
         )
 
@@ -879,10 +988,12 @@ if has_lr:
         total = left + right
         left_pct = left / total * 100
         right_pct = right / total * 100
+        left_disp = to_display_power(left, r.weight, use_wkg)
+        right_disp = to_display_power(right, r.weight, use_wkg)
         col.metric(
             r.name.replace(".fit", ""),
             f"{left_pct:.0f}% / {right_pct:.0f}%",
-            delta=f"L {left:.0f}W · R {right:.0f}W",
+            delta=f"L {left_disp:.{pd_}f}{pu} · R {right_disp:.{pd_}f}{pu}",
             delta_color="off",
         )
 
@@ -903,10 +1014,23 @@ if len(rides) == 2:
 
     if len(a_aligned) > 10 and len(b_aligned) > 10:
         st.subheader("Power vs Power")
-        st.caption(
-            "Each point is one matched second. A perfect-agreement line is shown "
-            "for reference — points above the line mean the Y-axis meter reads higher."
-        )
+
+        # This chart is designed for meter-vs-meter agreement on one rider.
+        # If the two files are clearly different riders (different weights or
+        # FTPs), warn the user — the "offset" number becomes meaningless as a
+        # calibration check.
+        different_riders = (abs(a.weight - b.weight) > 2) or (abs(a.ftp - b.ftp) > 10)
+        if different_riders:
+            st.caption(
+                "⚠️ The two files appear to be different riders (different FTP/weight). "
+                "This chart is designed to measure meter agreement on the same pedals — "
+                "with different riders the 'offset' reflects effort differences, not meter accuracy."
+            )
+        else:
+            st.caption(
+                "Each point is one matched second. A perfect-agreement line is shown "
+                "for reference — points above the line mean the Y-axis meter reads higher."
+            )
 
         merged = pd.merge_asof(
             a_aligned.sort_values("t"),
@@ -915,53 +1039,70 @@ if len(rides) == 2:
         ).dropna(subset=["a", "b"])
 
         if len(merged) > 10:
-            max_p = max(merged["a"].max(), merged["b"].max()) * 1.05
+            # Convert to display units — per-rider weight means the "perfect
+            # agreement" line is still y=x only when both weights are equal.
+            # If weights differ, the slope of perfect agreement becomes
+            # weight_a / weight_b — we compute that and use it as the reference.
+            a_disp = to_display_power(merged["a"], a.weight, use_wkg)
+            b_disp = to_display_power(merged["b"], b.weight, use_wkg)
+            max_p = max(a_disp.max(), b_disp.max()) * 1.05
+
+            # Reference slope — y=x in watts, but in W/kg it's (wa/wb)·x
+            ref_slope = 1.0
+            if use_wkg and a.weight and b.weight:
+                ref_slope = a.weight / b.weight
 
             scatter_fig = go.Figure()
             scatter_fig.add_trace(go.Scatter(
-                x=merged["a"], y=merged["b"],
+                x=a_disp, y=b_disp,
                 mode="markers",
                 marker=dict(size=3, color="#3EC5C9", opacity=0.35),
                 name="Matched seconds",
                 hovertemplate=(
-                    f"{a.name}: %{{x:.0f}} W<br>"
-                    f"{b.name}: %{{y:.0f}} W<extra></extra>"
+                    f"{a.name}: %{{x:.{pd_}f}} {pu}<br>"
+                    f"{b.name}: %{{y:.{pd_}f}} {pu}<extra></extra>"
                 ),
             ))
             scatter_fig.add_trace(go.Scatter(
-                x=[0, max_p], y=[0, max_p],
+                x=[0, max_p], y=[0, ref_slope * max_p],
                 mode="lines",
                 line=dict(color="#999", dash="dash", width=1),
-                name="Perfect agreement",
+                name=("Perfect agreement" if not use_wkg or ref_slope == 1
+                      else f"Perfect agreement (wt-corrected, y={ref_slope:.3f}x)"),
                 hoverinfo="skip",
             ))
 
+            # Best-fit slope is always computed in raw Watts — that's the
+            # physical calibration ratio between the two meters.
             x_vals = merged["a"].values
             y_vals = merged["b"].values
             mask = (x_vals > 0) & (y_vals > 0)
             overall_slope = None
             if mask.sum() > 10:
                 overall_slope = (x_vals[mask] * y_vals[mask]).sum() / (x_vals[mask] ** 2).sum()
+                # For plotting, convert the slope to display units
+                disp_slope = overall_slope * (a.weight / b.weight) if use_wkg else overall_slope
                 scatter_fig.add_trace(go.Scatter(
                     x=[0, max_p],
-                    y=[0, overall_slope * max_p],
+                    y=[0, disp_slope * max_p],
                     mode="lines",
                     line=dict(color="#C94FB8", width=1.5),
-                    name=f"Best fit (y = {overall_slope:.3f}·x)",
+                    name=f"Best fit (y = {disp_slope:.3f}·x)",
                     hoverinfo="skip",
                 ))
                 offset_pct = (overall_slope - 1) * 100
                 st.metric(
                     f"`{b.name}` reads…",
                     f"{offset_pct:+.1f}% vs `{a.name}`",
-                    help="Slope of the best-fit line through the origin. "
-                         "Positive = Y-axis meter reads higher.",
+                    help="Slope of the best-fit line through the origin, computed in Watts. "
+                         "This is the physical ratio between the two meters regardless of "
+                         "display units. Positive = Y-axis meter reads higher.",
                 )
 
             scatter_fig.update_layout(
                 height=500,
-                xaxis=dict(title=f"{a.name} (W)", range=[0, max_p], gridcolor="#eef0f4"),
-                yaxis=dict(title=f"{b.name} (W)", range=[0, max_p], gridcolor="#eef0f4",
+                xaxis=dict(title=f"{a.name} ({pu})", range=[0, max_p], gridcolor="#eef0f4"),
+                yaxis=dict(title=f"{b.name} ({pu})", range=[0, max_p], gridcolor="#eef0f4",
                            scaleanchor="x", scaleratio=1),
                 showlegend=True,
                 legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
@@ -1157,9 +1298,13 @@ def build_pdf_report() -> bytes:
 
     story = []
     story.append(Paragraph("FIT Compare — Report", h1))
+    riders_summary = " · ".join(
+        f"{r.name.replace('.fit', '')} ({r.ftp:.0f}W, {r.weight:.1f}kg)" for r in rides
+    )
     story.append(Paragraph(
         f"Generated {datetime.now().strftime('%Y-%m-%d %H:%M')} · "
-        f"{len(rides)} files · FTP {ftp} W",
+        f"Units: {pu}<br/>"
+        f"Riders: {riders_summary}",
         body,
     ))
     story.append(Spacer(1, 6 * mm))
