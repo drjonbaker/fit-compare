@@ -1201,7 +1201,7 @@ def build_pdf_report() -> bytes:
         story.append(PageBreak())
         story.append(Paragraph(title, h2))
         png = figure.to_image(format="png", width=1400, height=int(height_mm * 5),
-                              scale=2, engine="kaleido")
+                              scale=2)
         img = Image(io.BytesIO(png), width=180 * mm, height=height_mm * mm)
         story.append(img)
 
